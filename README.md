@@ -6,6 +6,12 @@ This repository contains the public code accompanying the paper:
 
 The code reproduces the PyBullet simulation dataset, trains ResNet-18 and ViT-Tiny regression models, evaluates the trained models on the additional C0-C4 evaluation set, and regenerates the paper figures from saved experiment outputs.
 
+## Simulation Demo
+
+A short PyBullet simulation demo is provided to illustrate the confined-workspace pick-and-place task and the spatial proximity risk grid.
+
+[Watch the simulation demo](docs/media/simulation_demo.mp4)
+
 ## Repository Contents
 
 ```text

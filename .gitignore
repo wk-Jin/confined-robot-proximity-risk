@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local notebooks and editor files
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Generated experiment artifacts
+outputs/*
+!outputs/.gitkeep
+release_assets/
+
+# Release-scale data and model files
+data/generated_dataset/*
+data/additional_evaluation_dataset/*
+!data/generated_dataset/.gitkeep
+!data/additional_evaluation_dataset/.gitkeep
+models/*
+!models/README.md
+
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.zip
+
+# Logs
+*.log

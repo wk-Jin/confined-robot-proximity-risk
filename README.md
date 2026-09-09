@@ -10,7 +10,7 @@ The code reproduces the PyBullet simulation dataset, trains ResNet-18 and ViT-Ti
 
 A short PyBullet simulation demo is provided to illustrate the confined-workspace pick-and-place task and the spatial proximity risk grid.
 
-[Watch the simulation demo](docs/media/simulation_demo.mp4)
+![Simulation demo](docs/media/simulation_demo.gif)
 
 ## Repository Contents
 

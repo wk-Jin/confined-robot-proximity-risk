@@ -4,7 +4,7 @@ This repository contains the public code accompanying the paper:
 
 **Predicting a Simulation-Derived Spatial Proximity Risk Indicator from Layout Images of a Confined Robot Workspace**
 
-The code reproduces the PyBullet simulation dataset, trains ResNet-18 and ViT-Tiny regression models, evaluates the trained models on the additional C0-C4 evaluation set, and regenerates the paper figures from saved experiment outputs.
+The code provides the PyBullet simulation and data-generation pipeline used in the study, trains ResNet-18 and ViT-Tiny regression models, evaluates the trained models on the additional C0-C4 evaluation set, and regenerates the paper figures from saved experiment outputs.
 
 ## Simulation Demo
 
@@ -243,6 +243,6 @@ python scripts/make_paper_figures.py --figures scorecam
 
 ## Notes on Reproducibility
 
-The trained checkpoints are provided because GPU kernels, library versions, and hardware can introduce small numerical differences during training. The released checkpoints should be used when reproducing the reported evaluation and Score-CAM figures exactly.
+The trained checkpoints are provided because GPU kernels, library versions, and hardware can introduce small numerical differences during training. The released checkpoints correspond to those used for the results reported in the manuscript.
 
 The dataset images are stored as NumPy arrays (`.npy`) and referenced from CSV files by relative path. This avoids machine-specific local paths and keeps the release portable.

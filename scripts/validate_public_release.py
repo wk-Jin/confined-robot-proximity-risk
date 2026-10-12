@@ -83,7 +83,8 @@ def validate_generated_dataset(args) -> None:
         ["layout_image_path", "invaded_grid_count", "clean_success"],
         csv_path,
     )
-    check_image_paths(dataframe, image_dir, "layout_image_path", args.max_image_checks, "generated dataset")
+    clean = dataframe[dataframe["clean_success"].astype(str).str.lower().isin(["1", "1.0", "true"])]
+    check_image_paths(clean, image_dir, "layout_image_path", args.max_image_checks, "generated dataset (clean-success rows)")
     print(f"[OK] generated dataset rows: {len(dataframe)}")
 
 

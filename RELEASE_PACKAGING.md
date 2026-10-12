@@ -26,8 +26,10 @@ data/
 |       `-- ...
 `-- additional_evaluation_dataset/
     |-- additional_evaluation_dataset.csv
+    |-- generation_summary.csv
+    |-- candidate_simulation_results.csv
     `-- layout_images/
-        |-- layout_...
+        |-- candidate_....npy
         `-- ...
 
 outputs/
@@ -51,7 +53,14 @@ layout_images/layout_000_trial_000.npy
 
 ## Build Release Archives
 
-From the repository root:
+From the repository root, first write any missing layout images of the generated
+dataset (images are regenerated from the trial parameters; existing files are kept):
+
+```bash
+python scripts/rebuild_layout_images.py
+```
+
+Then validate and build:
 
 ```bash
 python scripts/validate_public_release.py

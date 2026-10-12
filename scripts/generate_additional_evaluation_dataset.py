@@ -1,20 +1,31 @@
 """
 Generate the additional interpolation/extrapolation evaluation dataset.
 
-The script follows the two-stage sampling procedure described for the C0-C4
-additional evaluation in the paper:
+Sequential sampling procedure for the C0-C4 additional evaluation:
 
 1. Enumerate parameter combinations outside the model-development grid.
-2. Sample a fixed candidate pool from each C0-C4 category.
-3. Run the PyBullet simulation for each candidate.
-4. Select clean-success samples from each category for final evaluation.
+2. For each category, sort all combinations by combination_id and randomly
+   order them once with numpy.random.RandomState(seed).
+3. Simulate the combinations of each category in that fixed order until
+   --target-per-category clean-success samples have been obtained
+   (categories are processed from C4 to C0).
+4. The final dataset contains, for each category, the first
+   --target-per-category clean-success samples in the fixed order.
+5. Layout images are generated only for the final dataset rows.
+
+The final dataset is written only when every category has exactly
+--target-per-category clean-success samples. If a category runs out of
+combinations first, the script stops with an error and writes no final
+dataset. Resume is keyed by combination_id, so an interrupted run continues
+from where it stopped.
 
 Outputs:
     - all_combinations.csv: all enumerated candidate conditions and labels.
-    - sampled_candidate_pool.csv: sampled candidate pool before simulation.
-    - candidate_simulation_results.csv: simulation summaries for the pool.
+    - simulation_order.csv: fixed per-category simulation order.
+    - candidate_simulation_results.csv: simulation summaries of simulated rows.
+    - generation_summary.csv: simulated/clean/error counts per category.
     - additional_evaluation_dataset.csv: selected clean-success evaluation set.
-    - layout_images/*.npy: optional model-input layout images.
+    - layout_images/*.npy: model-input layout images of the final dataset only.
 
 Example:
     python generate_additional_evaluation_dataset.py --yes
@@ -46,7 +57,8 @@ for import_path in (SCRIPT_DIR, PROJECT_ROOT, PROJECT_ROOT / "src"):
 RANDOM_SEED = 42
 
 CATEGORIES = ["C0", "C1", "C2", "C3", "C4"]
-DEFAULT_POOL_PER_CATEGORY = 400
+# Simulation order of categories: the lowest clean-success rate first.
+RUN_CATEGORY_ORDER = ["C4", "C3", "C2", "C1", "C0"]
 DEFAULT_TARGET_PER_CATEGORY = 200
 
 
@@ -137,19 +149,13 @@ def parse_args():
         "--seed",
         type=int,
         default=RANDOM_SEED,
-        help="Random seed used for candidate-pool and final clean-sample selection.",
-    )
-    parser.add_argument(
-        "--pool-per-category",
-        type=int,
-        default=DEFAULT_POOL_PER_CATEGORY,
-        help="Number of candidates sampled before simulation for each C0-C4 category.",
+        help="Random seed used for the fixed per-category simulation order.",
     )
     parser.add_argument(
         "--target-per-category",
         type=int,
         default=DEFAULT_TARGET_PER_CATEGORY,
-        help="Number of clean-success samples selected for each C0-C4 category.",
+        help="Number of clean-success samples required for each C0-C4 category.",
     )
     parser.add_argument(
         "--yes",
@@ -164,7 +170,10 @@ def parse_args():
     parser.add_argument(
         "--save-layout-images",
         action="store_true",
-        help="Save 128x128 model-input layout images for simulated candidates.",
+        help=(
+            "Kept for compatibility; no effect. 128x128 layout images are always "
+            "written for the final dataset only."
+        ),
     )
     parser.add_argument(
         "--save-step-data",
@@ -185,7 +194,7 @@ def parse_args():
     parser.add_argument(
         "--combinations-only",
         action="store_true",
-        help="Only write all_combinations.csv and sampled_candidate_pool.csv.",
+        help="Only write all_combinations.csv and simulation_order.csv.",
     )
     parser.add_argument(
         "--stats",
@@ -201,8 +210,9 @@ def output_paths(output_dir):
         "root": root,
         "layout_images": root / "layout_images",
         "all_combinations": root / "all_combinations.csv",
-        "candidate_pool": root / "sampled_candidate_pool.csv",
+        "simulation_order": root / "simulation_order.csv",
         "simulation_results": root / "candidate_simulation_results.csv",
+        "generation_summary": root / "generation_summary.csv",
         "evaluation_dataset": root / "additional_evaluation_dataset.csv",
         "step_data": root / "step_data_all.csv",
         "progress_log": root / "progress.log",
@@ -303,21 +313,33 @@ def generate_all_combinations():
     return df
 
 
-def sample_by_category(df, per_category, seed):
-    sampled = []
-    for category in CATEGORIES:
-        category_df = df[df["category"] == category]
-        n_take = min(per_category, len(category_df))
-        if n_take == 0:
+def build_simulation_order(df, seed):
+    """Fixed per-category simulation order.
+
+    Each category is sorted by combination_id and permuted once with
+    numpy.random.RandomState(seed), whose stream is stable across numpy
+    versions. candidate_id is set equal to combination_id so that row
+    identity does not depend on the order or on the number simulated.
+    """
+    ordered = []
+    for category in RUN_CATEGORY_ORDER:
+        category_df = (
+            df[df["category"] == category]
+            .sort_values("combination_id")
+            .reset_index(drop=True)
+        )
+        if category_df.empty:
             continue
-        sampled.append(category_df.sample(n=n_take, random_state=seed))
+        permutation = np.random.RandomState(seed).permutation(len(category_df))
+        category_df = category_df.iloc[permutation].reset_index(drop=True)
+        category_df.insert(0, "order_in_category", range(len(category_df)))
+        ordered.append(category_df)
 
-    if not sampled:
-        return pd.DataFrame(columns=df.columns)
+    if not ordered:
+        return pd.DataFrame(columns=["candidate_id", "order_in_category", *df.columns])
 
-    result = pd.concat(sampled, ignore_index=True)
-    result = result.sample(frac=1, random_state=seed).reset_index(drop=True)
-    result.insert(0, "candidate_id", range(len(result)))
+    result = pd.concat(ordered, ignore_index=True)
+    result.insert(0, "candidate_id", result["combination_id"].astype(int))
     return result
 
 
@@ -426,93 +448,287 @@ def clean_result_row(row, sim_result, sim_time_s, layout_image_path=None):
     return result
 
 
-def run_candidate_simulations(candidate_df, paths, args):
-    simulation_module = load_simulation_module()
+PARAMETER_COLUMNS = [
+    "fence_x",
+    "pillar_x",
+    "pillar_y",
+    "pick_x_offset",
+    "pick_y_offset",
+    "place_x_offset",
+    "place_y_offset",
+]
+
+
+def load_existing_results(order_df, paths, args):
+    """Load previous results keyed by combination_id and check consistency."""
     results_path = paths["simulation_results"]
+    if args.no_resume or not results_path.exists():
+        return {}
 
-    existing_results = []
-    completed = set()
-    if not args.no_resume and results_path.exists():
-        existing_df = pd.read_csv(results_path)
-        existing_results = existing_df.to_dict("records")
-        completed = set(existing_df["candidate_id"].astype(int).tolist())
-        log_progress(paths, f"Resume: {len(completed)} candidates already completed")
+    existing_df = pd.read_csv(results_path)
+    if existing_df.empty:
+        return {}
+    if "combination_id" not in existing_df.columns:
+        raise SystemExit(
+            f"{results_path} has no combination_id column and cannot be resumed. "
+            "Use a new --output-dir or --no-resume."
+        )
 
-    results = list(existing_results)
-    total = len(candidate_df)
+    existing_df = existing_df.drop_duplicates("combination_id", keep="first")
+    reference = order_df.set_index("combination_id")
+    for _, row in existing_df.iterrows():
+        combination_id = int(row["combination_id"])
+        if combination_id not in reference.index:
+            raise SystemExit(
+                f"Resume check failed: combination_id {combination_id} in {results_path} "
+                "is not in the current combination list."
+            )
+        expected = reference.loc[combination_id]
+        if str(row["category"]) != str(expected["category"]):
+            raise SystemExit(
+                f"Resume check failed: category mismatch for combination_id {combination_id}."
+            )
+        for column in PARAMETER_COLUMNS:
+            if column in row.index and pd.notna(row[column]):
+                if abs(float(row[column]) - float(expected[column])) > 1e-6:
+                    raise SystemExit(
+                        f"Resume check failed: {column} mismatch for "
+                        f"combination_id {combination_id}."
+                    )
+
+    log_progress(paths, f"Resume: {len(existing_df)} simulated combinations loaded")
+    return {
+        int(record["combination_id"]): record
+        for record in existing_df.to_dict("records")
+    }
+
+
+def simulate_one(simulation_module, row, paths, args):
+    sim_started = time.time()
+    try:
+        sim_result = run_simulation_wrapper(
+            simulation_module=simulation_module,
+            row=row,
+            headless=not args.gui,
+        )
+        # Layout images are not saved here. They are generated only for the
+        # final dataset after selection (see write_final_layout_images).
+        layout_image_path = None
+        if args.save_step_data:
+            write_step_data(sim_result.get("_step_logger"), row, paths["step_data"])
+    except Exception as exc:
+        sim_result = {
+            "clean_success": False,
+            "simulation_error": str(exc),
+        }
+        layout_image_path = None
+
+    sim_time_s = time.time() - sim_started
+    return clean_result_row(row, sim_result, sim_time_s, layout_image_path)
+
+
+def run_until_target(order_df, paths, args):
+    """Simulate each category in its fixed order until the target is reached.
+
+    Every position before the stopping point has a result, so the first
+    target clean-success rows by order_in_category form the final dataset.
+    If a category runs out of combinations first, the results are saved and
+    the script stops with an error.
+    """
+    simulation_module = None
+    results_path = paths["simulation_results"]
+    results_by_id = load_existing_results(order_df, paths, args)
+    target = args.target_per_category
+
     started = time.time()
     newly_completed = 0
+    summary_rows = []
 
-    for _, row in candidate_df.iterrows():
-        candidate_id = int(row["candidate_id"])
-        if candidate_id in completed:
-            continue
+    def save_results():
+        pd.DataFrame(list(results_by_id.values())).to_csv(results_path, index=False)
 
-        sim_started = time.time()
-        try:
-            sim_result = run_simulation_wrapper(
-                simulation_module=simulation_module,
-                row=row,
-                headless=not args.gui,
-            )
-            layout_image_path = None
-            if args.save_layout_images:
-                layout_image_path = save_layout_image(simulation_module, row, paths)
-            if args.save_step_data:
-                write_step_data(sim_result.get("_step_logger"), row, paths["step_data"])
-        except Exception as exc:
-            sim_result = {
-                "clean_success": False,
-                "simulation_error": str(exc),
+    for category in RUN_CATEGORY_ORDER:
+        category_df = order_df[order_df["category"] == category]
+        n_clean = 0
+        n_error = 0
+        n_processed = 0
+        stop_position = None
+
+        for _, row in category_df.iterrows():
+            combination_id = int(row["combination_id"])
+            record = results_by_id.get(combination_id)
+            if record is None:
+                if simulation_module is None:
+                    simulation_module = load_simulation_module()
+                record = simulate_one(simulation_module, row, paths, args)
+                results_by_id[combination_id] = record
+                newly_completed += 1
+
+                if args.save_every > 0 and newly_completed % args.save_every == 0:
+                    save_results()
+                    elapsed = time.time() - started
+                    avg = elapsed / max(newly_completed, 1)
+                    log_progress(
+                        paths,
+                        f"Progress {category}: clean {n_clean}/{target}, "
+                        f"processed {n_processed + 1}, avg={avg:.1f}s/sim",
+                    )
+
+            n_processed += 1
+            if is_clean_success(record.get("clean_success")):
+                n_clean += 1
+            error_value = record.get("simulation_error")
+            if error_value is not None and pd.notna(error_value) and str(error_value):
+                n_error += 1
+
+            if n_clean >= target:
+                stop_position = int(row["order_in_category"])
+                break
+
+        save_results()
+        summary_rows.append(
+            {
+                "category": category,
+                "total_combinations": int(len(category_df)),
+                "n_simulated": int(n_processed),
+                "n_clean": int(n_clean),
+                "n_non_clean": int(n_processed - n_clean),
+                "n_simulation_error": int(n_error),
+                "clean_rate": float(n_clean / n_processed) if n_processed else float("nan"),
+                "stop_order_in_category": stop_position,
+                "seed": int(args.seed),
             }
-            layout_image_path = None
+        )
+        pd.DataFrame(summary_rows).to_csv(paths["generation_summary"], index=False)
+        log_progress(
+            paths,
+            f"{category}: clean {n_clean}/{target} after {n_processed} simulated "
+            f"of {len(category_df)} combinations",
+        )
 
-        sim_time_s = time.time() - sim_started
-        results.append(clean_result_row(row, sim_result, sim_time_s, layout_image_path))
-        newly_completed += 1
-
-        if args.save_every > 0 and newly_completed % args.save_every == 0:
-            pd.DataFrame(results).to_csv(results_path, index=False)
-            elapsed = time.time() - started
-            remaining = max(total - len(results), 0)
-            avg = elapsed / max(newly_completed, 1)
-            log_progress(
-                paths,
-                f"Progress: {len(results)}/{total}, "
-                f"avg={avg:.1f}s, remaining~{remaining * avg / 60:.1f}min",
+        if n_clean < target:
+            raise SystemExit(
+                f"{category} ran out of combinations: only {n_clean} clean-success "
+                f"samples among all {len(category_df)} combinations "
+                f"(target {target}). No final dataset was written."
             )
 
-    result_df = pd.DataFrame(results)
-    result_df.to_csv(results_path, index=False)
-    return result_df
+    result_df = pd.DataFrame(list(results_by_id.values()))
+    return result_df, pd.DataFrame(summary_rows)
 
 
 def is_clean_success(value):
+    if value is None:
+        return False
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes"}
+        return value.strip().lower() in {"1", "1.0", "true", "yes"}
+    if isinstance(value, float) and np.isnan(value):
+        return False
     return bool(value)
 
 
-def select_clean_evaluation_dataset(result_df, target_per_category, seed):
+def select_clean_evaluation_dataset(result_df, order_df, target_per_category):
+    """First target clean-success rows of each category in the fixed order."""
     if "clean_success" not in result_df.columns:
         raise ValueError("Simulation results do not contain a clean_success column.")
 
-    clean_df = result_df[result_df["clean_success"].map(is_clean_success)].copy()
+    reference = order_df[["combination_id", "order_in_category"] + PARAMETER_COLUMNS].rename(
+        columns={column: f"{column}__order" for column in PARAMETER_COLUMNS}
+    )
+    merged = result_df.drop(columns=["order_in_category"], errors="ignore").merge(
+        reference, on="combination_id", how="left", validate="one_to_one"
+    )
+    clean_df = merged[merged["clean_success"].map(is_clean_success)].copy()
+
     selected = []
     for category in CATEGORIES:
-        category_df = clean_df[clean_df["category"] == category]
-        n_take = min(target_per_category, len(category_df))
-        if n_take == 0:
-            continue
-        selected.append(category_df.sample(n=n_take, random_state=seed))
-
-    if not selected:
-        return pd.DataFrame(columns=result_df.columns)
+        category_df = clean_df[clean_df["category"] == category].sort_values(
+            "order_in_category"
+        )
+        if len(category_df) < target_per_category:
+            raise SystemExit(
+                f"{category}: only {len(category_df)} clean-success samples "
+                f"(target {target_per_category}). No final dataset was written."
+            )
+        selected.append(category_df.head(target_per_category))
 
     final_df = pd.concat(selected, ignore_index=True)
-    final_df = final_df.sample(frac=1, random_state=seed).reset_index(drop=True)
     final_df.insert(0, "evaluation_id", range(len(final_df)))
+    validate_evaluation_dataset(final_df, target_per_category)
+    return final_df.drop(columns=[f"{column}__order" for column in PARAMETER_COLUMNS])
+
+
+def write_final_layout_images(final_df, paths):
+    """Generate layout images for the final dataset rows only.
+
+    Images depend only on the layout and trial parameters, so they are
+    generated after selection with the same LayoutImageGenerator used for
+    the model-development dataset.
+    """
+    simulation_module = load_simulation_module()
+    final_df = final_df.copy()
+    image_paths = []
+    for _, row in final_df.iterrows():
+        image_paths.append(save_layout_image(simulation_module, row, paths))
+    final_df["layout_image_path"] = image_paths
+
+    expected_names = {Path(path).name for path in image_paths}
+    missing = [name for name in expected_names if not (paths["layout_images"] / name).exists()]
+    if missing:
+        raise SystemExit(f"{len(missing)} final layout images were not written.")
+
+    extra = [
+        path.name
+        for path in paths["layout_images"].glob("*.npy")
+        if path.name not in expected_names
+    ]
+    if extra:
+        print(
+            f"Warning: {paths['layout_images']} contains {len(extra)} .npy files "
+            "that are not part of the final dataset."
+        )
     return final_df
+
+
+def validate_evaluation_dataset(final_df, target_per_category):
+    """Checks run before the final dataset is written."""
+    problems = []
+
+    counts = final_df["category"].value_counts()
+    for category in CATEGORIES:
+        if int(counts.get(category, 0)) != target_per_category:
+            problems.append(
+                f"{category} has {int(counts.get(category, 0))} rows, "
+                f"expected {target_per_category}"
+            )
+
+    if not final_df["clean_success"].map(is_clean_success).all():
+        problems.append("non-clean-success rows present")
+
+    if final_df["combination_id"].duplicated().any():
+        problems.append("duplicated combination_id")
+
+    for _, row in final_df.iterrows():
+        combination_id = int(row["combination_id"])
+        reference_values = [float(row[f"{column}__order"]) for column in PARAMETER_COLUMNS]
+        _, category, _ = categorize_combination(*reference_values)
+        if category != row["category"]:
+            problems.append(
+                f"combination_id {combination_id}: stored category "
+                f"{row['category']} but parameters give {category}"
+            )
+            break
+        for column, expected in zip(PARAMETER_COLUMNS, reference_values):
+            if column in row.index and pd.notna(row[column]):
+                if abs(float(row[column]) - expected) > 1e-6:
+                    problems.append(
+                        f"combination_id {combination_id}: simulated {column} "
+                        f"{row[column]} differs from the combination list {expected}"
+                    )
+                    break
+
+    if problems:
+        raise SystemExit("Final dataset validation failed: " + "; ".join(problems))
 
 
 def print_counts(label, df):
@@ -526,7 +742,7 @@ def print_counts(label, df):
 
 
 def print_existing_stats(paths):
-    for key in ["all_combinations", "candidate_pool", "simulation_results", "evaluation_dataset"]:
+    for key in ["all_combinations", "simulation_order", "simulation_results", "evaluation_dataset"]:
         path = paths[key]
         if not path.exists():
             print(f"{path.name}: not found")
@@ -537,14 +753,22 @@ def print_existing_stats(paths):
             clean_count = df["clean_success"].map(is_clean_success).sum()
             print(f"clean_success: {clean_count}/{len(df)}")
 
+    summary_path = paths["generation_summary"]
+    if summary_path.exists():
+        print("\n" + "=" * 70)
+        print(summary_path.name)
+        print("=" * 70)
+        print(pd.read_csv(summary_path).to_string(index=False))
+
 
 def confirm_or_exit(args, candidate_count):
     if args.yes or args.combinations_only or args.stats:
         return
 
     print(
-        f"This will run up to {candidate_count} PyBullet simulations "
-        "for the additional evaluation candidate pool."
+        "This will run PyBullet simulations in the fixed per-category order until "
+        f"{args.target_per_category} clean-success samples are obtained for each "
+        f"category (at most {candidate_count} combinations in total)."
     )
     answer = input("Continue? (y/n): ").strip().lower()
     if answer != "y":
@@ -565,29 +789,34 @@ def main():
     all_df.to_csv(paths["all_combinations"], index=False)
     print_counts("All combinations", all_df)
 
-    candidate_df = sample_by_category(
-        all_df,
-        per_category=args.pool_per_category,
-        seed=args.seed,
-    )
-    candidate_df.to_csv(paths["candidate_pool"], index=False)
-    print_counts("Sampled candidate pool", candidate_df)
+    order_df = build_simulation_order(all_df, seed=args.seed)
+    order_df.to_csv(paths["simulation_order"], index=False)
+    print_counts("Simulation order", order_df)
 
     if args.combinations_only:
         print(f"\nWrote combinations to: {paths['root']}")
         return
 
-    confirm_or_exit(args, len(candidate_df))
-    result_df = run_candidate_simulations(candidate_df, paths, args)
+    if paths["evaluation_dataset"].exists():
+        paths["evaluation_dataset"].unlink()
+
+    confirm_or_exit(args, len(order_df))
+    result_df, summary_df = run_until_target(order_df, paths, args)
     print_counts("Candidate simulation results", result_df)
 
     evaluation_df = select_clean_evaluation_dataset(
         result_df,
+        order_df,
         target_per_category=args.target_per_category,
-        seed=args.seed,
     )
+    evaluation_df = write_final_layout_images(evaluation_df, paths)
     evaluation_df.to_csv(paths["evaluation_dataset"], index=False)
     print_counts("Selected additional evaluation dataset", evaluation_df)
+
+    print("\n" + "=" * 70)
+    print("Generation summary")
+    print("=" * 70)
+    print(summary_df.to_string(index=False))
 
     print(f"\nOutput directory: {paths['root']}")
 

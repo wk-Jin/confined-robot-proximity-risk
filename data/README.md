@@ -20,8 +20,10 @@ data/
 |       `-- ...
 `-- additional_evaluation_dataset/
     |-- additional_evaluation_dataset.csv
+    |-- generation_summary.csv
+    |-- candidate_simulation_results.csv
     `-- layout_images/
-        |-- layout_...
+        |-- candidate_....npy
         `-- ...
 ```
 
